@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Video Processing</title>
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #222; }
+    .lil-gui { 
+        --width: 450px;
+        --font-size: 18px;
+        --widget-height: 35px;
+        --spacing: 8px;
+      }
+      .lil-gui select {
+      font-size: 18px !important;
+      height: 100% !important;
+    }
+   /* Make the labels/names larger */
+    .lil-gui .name {
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.184.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+    import WEBGL from "three/addons/capabilities/WebGL.js";
+    import { TextureProcessor, vertexShader, fragmentShader } from "./VideoProcessor.js";
+
+    let camera, controls, scene, renderer, video, videoTexture, textureProcessor, processingMaterial;
+
+    init();
+
+    function init() {
+      if (!WEBGL.isWebGL2Available()) return;
+
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("webgl2");
+      renderer = new THREE.WebGLRenderer({ canvas, context });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.autoClear = false;
+      document.body.appendChild(canvas);
+
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10);
+      camera.position.z = 1.2;
+      controls = new OrbitControls(camera, renderer.domElement);
+
+      video = document.createElement("video");
+      video.src = "video.mp4"; 
+      video.muted = true;
+      video.loop = true;
+      video.crossOrigin = "anonymous";
+
+      video.onloadeddata = () => {
+        videoTexture = new THREE.VideoTexture(video);
+        
+        processingMaterial = new THREE.RawShaderMaterial({
+          uniforms: {
+            filterMode: { value: 0 },
+            imageTexture: { value: videoTexture },
+            blurRadius: { value: 5 },
+            colorScaleR: { value: 1.0 }, colorScaleG: { value: 1.0 }, colorScaleB: { value: 1.0 },
+            invertColors: { value: false },
+            displayNorm: { value: true },
+            useEightConnected: { value: true },
+            sigma: { value: 3.0 },
+            horizontal: { value: true }
+          },
+          vertexShader, fragmentShader, glslVersion: THREE.GLSL3
+        });
+
+        textureProcessor = new TextureProcessor(video.videoWidth, video.videoHeight, processingMaterial);
+
+        const aspect = video.videoHeight / video.videoWidth;
+        
+        // Final Output Plane
+        const planeGeo = new THREE.PlaneGeometry(1, aspect);
+        const processedMesh = new THREE.Mesh(planeGeo, new THREE.MeshBasicMaterial({ map: textureProcessor.outputTexture }));
+        processedMesh.position.x = 0.6;
+        scene.add(processedMesh);
+
+        // Original Plane
+        const originalMesh = new THREE.Mesh(planeGeo, new THREE.MeshBasicMaterial({ map: videoTexture }));
+        originalMesh.position.x = -0.6;
+        scene.add(originalMesh);
+
+        setupGUI();
+        video.play();
+        animate();
+      };
+    }
+
+    function setupGUI() {
+      const gui = new GUI();
+      const params = processingMaterial.uniforms;
+
+      // --- 1. PLAYBACK TOGGLE LOGIC ---
+      const playbackControls = {
+        toggle: function() {
+          if (video.paused) {
+            video.play();
+          } else {
+            video.pause();
+          }
+        }
+      };
+
+      // Add the button and capture its controller to update the label
+      const playPauseBtn = gui.add(playbackControls, "toggle")
+        .name(video.paused ? "▶ Play Video" : "⏸ Pause Video");
+
+      // Sync button label if the video state changes externally (like autoplay)
+      video.addEventListener('play', () => playPauseBtn.name("⏸ Pause Video"));
+      video.addEventListener('pause', () => playPauseBtn.name("▶ Play Video"));
+
+      // 1. Dropdown to select Median Filter
+      const modeCtrl = gui.add(params.filterMode, "value", { 
+        "Box Blur": 0, 
+        "Laplacian": 1, 
+        "Gaussian": 2, 
+        "Median Denoise": 3 
+        }).name("Filter Mode");
+      
+      const fBox = gui.addFolder("Box Blur");
+      fBox.add(params.blurRadius, "value", 1, 20, 1).name("Radius");
+      
+      const fLap = gui.addFolder("Laplacian");
+      fLap.add(params.displayNorm, "value").name("Show Norm");
+      
+      const fGau = gui.addFolder("Gaussian");
+      fGau.add(params.blurRadius, "value", 1, 50, 1).name("Kernel Size");
+      fGau.add(params.sigma, "value", 0.1, 10.0).name("Sigma");
+
+      const medFol = gui.addFolder("Denoising (Median)");
+      medFol.add(params.blurRadius, "value", { "3x3 Square": 1, "5x5 Square": 2 })
+        .name("Kernel Size");
+      medFol.add({ tip: "Removes Salt & Pepper" }, "tip").name("Note").disable();
+
+      const refresh = () => {
+        fBox.show(params.filterMode.value === 0);
+        fLap.show(params.filterMode.value === 1);
+        fGau.show(params.filterMode.value === 2);
+        medFol.show(params.filterMode.value === 3);
+      };
+      modeCtrl.onChange(refresh);
+      refresh();
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      if (textureProcessor) textureProcessor.process(renderer, videoTexture);
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
